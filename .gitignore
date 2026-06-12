@@ -1,0 +1,23 @@
+﻿# Credenciales - NUNCA subir
+ServiceAccount/service_account.json
+*.json
+!package.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Logs
+Logs/
+*.log
+
+# Excel temporales
+~$*.xlsx
+~$*.xlsm
+
+# OS
+Thumbs.db
+.DS_Store
