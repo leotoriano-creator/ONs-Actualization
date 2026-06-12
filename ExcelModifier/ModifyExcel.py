@@ -23,8 +23,11 @@ Requisitos:
 from __future__ import annotations
 
 import io
+import os
 import re
 import sys
+import json
+import base64
 import math
 import shutil
 from copy import copy
@@ -45,7 +48,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 # CONFIG
 # ============================================================
 
-DRIVE_FILE_ID = "19Hr6IBST72-D9j2mNTgcBH_-XmI2F9Py"
+DRIVE_FILE_ID = os.getenv("DRIVE_FILE_ID", "19Hr6IBST72-D9j2mNTgcBH_-XmI2F9Py")
 WORKSHEET_NAME = "BASE"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -59,7 +62,7 @@ LOCAL_BACKUP_FILE = PROJECT_ROOT / "DataStorage" / f"backup_Base_ONs_Nueva_{date
 LOCAL_UPDATED_FILE = PROJECT_ROOT / "DataStorage" / "Base ONs - Nueva_ACTUALIZADA.xlsx"
 PREVIEW_FILE = PROJECT_ROOT / "DataStorage" / "preview_base_ons_a_insertar.xlsx"
 
-DRY_RUN = False
+DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() in {"1", "true", "yes", "y", "si", "sí"}
 
 
 # ============================================================
@@ -71,22 +74,61 @@ def log(msg: str) -> None:
     print(f"{ahora} | {msg}")
 
 
+
+# ============================================================
+# CREDENCIALES GOOGLE
+# ============================================================
+
+def cargar_credenciales_google(scopes):
+    """
+    Railway:
+        Lee GOOGLE_SERVICE_ACCOUNT_JSON desde variables de entorno.
+
+    Local:
+        Si no existe la variable, usa ServiceAccount/service_account.json.
+    """
+    raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+
+    if raw_json:
+        try:
+            info = json.loads(raw_json)
+        except json.JSONDecodeError:
+            try:
+                decoded = base64.b64decode(raw_json).decode("utf-8")
+                info = json.loads(decoded)
+            except Exception as e:
+                raise ValueError(
+                    "GOOGLE_SERVICE_ACCOUNT_JSON existe, pero no pude parsearla "
+                    "como JSON directo ni como base64(JSON). Revisá cómo la pegaste en Railway."
+                ) from e
+
+        if "private_key" in info and isinstance(info["private_key"], str):
+            info["private_key"] = info["private_key"].replace("\\n", "\n")
+
+        return Credentials.from_service_account_info(info, scopes=scopes)
+
+    if SERVICE_ACCOUNT_FILE.exists():
+        return Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
+
+    raise FileNotFoundError(
+        "No encontré credenciales de Google. En Railway definí GOOGLE_SERVICE_ACCOUNT_JSON "
+        "con el JSON completo de la service account."
+    )
+
+
 # ============================================================
 # DRIVE API
 # ============================================================
 
 def conectar_drive():
-    if not SERVICE_ACCOUNT_FILE.exists():
-        raise FileNotFoundError(f"No encontré credenciales: {SERVICE_ACCOUNT_FILE}")
-
     scopes = ["https://www.googleapis.com/auth/drive"]
 
-    creds = Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE,
-        scopes=scopes,
-    )
+    creds = cargar_credenciales_google(scopes)
 
-    log(f"Service account usada: {creds.service_account_email}")
+    try:
+        log(f"Service account usada: {creds.service_account_email}")
+    except Exception:
+        log("Service account usada: desconocida")
 
     service = build("drive", "v3", credentials=creds)
     return service
