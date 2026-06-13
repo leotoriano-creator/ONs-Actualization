@@ -1,0 +1,6 @@
+pandas
+openpyxl
+requests
+xlrd
+google-api-python-client
+google-auth
