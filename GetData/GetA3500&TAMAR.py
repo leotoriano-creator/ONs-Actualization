@@ -20,6 +20,7 @@ Requisitos:
 
 from __future__ import annotations
 
+import io
 import re
 import sys
 from pathlib import Path
@@ -307,7 +308,23 @@ def leer_xls_bcra(url: str) -> pd.DataFrame:
     response = requests.get(url, headers=headers, timeout=TIMEOUT_SECONDS)
     response.raise_for_status()
 
-    return pd.read_excel(response.content, header=None)
+    contenido = response.content
+
+    if not contenido:
+        raise RuntimeError("El BCRA devolvió un archivo vacío para COM3500.")
+
+    log(
+        f"COM3500 descargado: {len(contenido):,} bytes | "
+        f"Content-Type: {response.headers.get('Content-Type', 'desconocido')}"
+    )
+
+    # pandas en Railway no acepta bytes crudos como entrada.
+    # BytesIO los convierte en un objeto de archivo en memoria.
+    return pd.read_excel(
+        io.BytesIO(contenido),
+        engine="xlrd",
+        header=None,
+    )
 
 
 def detectar_tabla_com3500(raw: pd.DataFrame) -> pd.DataFrame:
