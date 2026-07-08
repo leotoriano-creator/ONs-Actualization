@@ -20,7 +20,7 @@ Regla:
     - Descarga el .xlsx desde Drive, lo edita con openpyxl y lo vuelve a subir.
 
 Requisitos:
-    pip install pandas openpyxl google-api-python-client google-auth
+    pip install pandas openpyxl google-api-python-client google-auth psycopg2-binary
 """
 
 from __future__ import annotations
@@ -33,7 +33,8 @@ import base64
 import shutil
 from copy import copy
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
+from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -62,7 +63,52 @@ LOCAL_DOWNLOAD_FILE = PROJECT_ROOT / "DataStorage" / "Base ONs - Nueva_VARIABLES
 LOCAL_BACKUP_FILE = PROJECT_ROOT / "DataStorage" / f"backup_Base_ONs_Nueva_VARIABLES_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
 LOCAL_UPDATED_FILE = PROJECT_ROOT / "DataStorage" / "Base ONs - Nueva_VARIABLES_ACTUALIZADA.xlsx"
 
+
+def _manual_load_env_file(path: Path) -> None:
+    """Carga .env/.ENV local sin pisar variables ya existentes. Sirve para correr desde VS Code."""
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+
+        if not key:
+            continue
+
+        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+            value = value[1:-1]
+
+        os.environ.setdefault(key, value)
+
+
+def load_local_env_files() -> None:
+    seen = set()
+    for p in [PROJECT_ROOT / ".env", PROJECT_ROOT / ".ENV", Path.cwd() / ".env", Path.cwd() / ".ENV"]:
+        rp = str(p.resolve())
+        if rp in seen:
+            continue
+        seen.add(rp)
+        _manual_load_env_file(p)
+
+    try:
+        from dotenv import load_dotenv
+        for p in [PROJECT_ROOT / ".env", PROJECT_ROOT / ".ENV", Path.cwd() / ".env", Path.cwd() / ".ENV"]:
+            if p.exists():
+                load_dotenv(p, override=False)
+    except Exception:
+        pass
+
+
+load_local_env_files()
+
 DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() in {"1", "true", "yes", "y", "si", "sí"}
+SQL_UPDATE_ENABLED = os.getenv("SQL_UPDATE_ENABLED", "true").strip().lower() not in {"0", "false", "no", "n"}
 
 
 # ============================================================
@@ -187,6 +233,162 @@ def subir_xlsx_drive(service, file_id: str, archivo: Path) -> None:
 
     log(f"Archivo actualizado en Drive OK. ID: {updated.get('id')}")
 
+
+
+# ============================================================
+# POSTGRESQL - on_primaria_variables_mercado
+# ============================================================
+
+def connect_db_sql():
+    try:
+        import psycopg2
+    except ImportError as e:
+        raise RuntimeError("Falta instalar psycopg2-binary. Ejecutá: pip install psycopg2-binary") from e
+
+    database_url = (os.getenv("DATABASE_URL", "").strip()
+                    or os.getenv("DATABASE_PUBLIC_URL", "").strip())
+    if database_url:
+        return psycopg2.connect(database_url)
+
+    required = ["PGHOST", "PGDATABASE", "PGUSER", "PGPASSWORD"]
+    missing = [k for k in required if not os.getenv(k)]
+    if missing:
+        raise RuntimeError(
+            "Faltan credenciales DB. Definí DATABASE_URL en .ENV o estas variables: " + ", ".join(missing)
+        )
+
+    return psycopg2.connect(
+        host=os.getenv("PGHOST"),
+        port=int(os.getenv("PGPORT", "5432")),
+        dbname=os.getenv("PGDATABASE"),
+        user=os.getenv("PGUSER"),
+        password=os.getenv("PGPASSWORD"),
+        sslmode=os.getenv("PGSSLMODE", "require"),
+    )
+
+
+def ensure_variables_schema(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'on_primaria_variables_mercado'
+        """)
+        cols = {r[0] for r in cur.fetchall()}
+
+    required = {"fecha", "badlar", "tamar", "com3500"}
+    missing = required - cols
+    if missing:
+        raise RuntimeError(
+            "La tabla on_primaria_variables_mercado no tiene el esquema esperado. Faltan columnas: "
+            + ", ".join(sorted(missing))
+        )
+
+
+def _to_db_date(x):
+    if x is None:
+        return None
+    if isinstance(x, datetime):
+        return x.date()
+    if isinstance(x, date):
+        return x
+    try:
+        if pd.isna(x):
+            return None
+    except Exception:
+        pass
+    dt = pd.to_datetime(x, errors="coerce")
+    if pd.isna(dt):
+        return None
+    return dt.date()
+
+
+def _to_db_decimal(x):
+    if x is None:
+        return None
+    try:
+        if pd.isna(x):
+            return None
+    except Exception:
+        pass
+    if isinstance(x, Decimal):
+        return x
+    if isinstance(x, bool):
+        return None
+    if isinstance(x, (int, float)):
+        return Decimal(str(x))
+    s = str(x).replace("\u00A0", " ").strip()
+    if not s or s.upper() in {"#N/A", "#VALUE!", "#REF!", "#DIV/0!", "N/A", "NA", "NULL", "NONE", "NAN"}:
+        return None
+    if s in {"-", "–", "—"}:
+        return None
+    s = s.replace("%", "")
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s and "." not in s:
+        s = s.replace(",", ".")
+    s = "".join(ch for ch in s if ch in "0123456789.-+")
+    if not s or s in {".", "-", "+"}:
+        return None
+    try:
+        return Decimal(s)
+    except InvalidOperation:
+        return None
+
+
+def upsert_variables_sql(df_badlar: pd.DataFrame, df_tamar: pd.DataFrame, df_com: pd.DataFrame) -> int:
+    """
+    Upsert de todas las variables disponibles a SQL.
+    BADLAR/TAMAR quedan en puntos porcentuales y COM3500 como tipo de cambio,
+    igual que la hoja VARIABLES y como espera on_primaria_view.
+    """
+    variables: dict[date, dict[str, Decimal | None]] = {}
+
+    def add(df: pd.DataFrame, key: str) -> None:
+        if df is None or df.empty:
+            return
+        for _, r in df.iterrows():
+            f = _to_db_date(r.get("fecha"))
+            v = _to_db_decimal(r.get("valor"))
+            if f is None or v is None:
+                continue
+            variables.setdefault(f, {"badlar": None, "tamar": None, "com3500": None})[key] = v
+
+    add(df_badlar, "badlar")
+    add(df_tamar, "tamar")
+    add(df_com, "com3500")
+
+    rows = [
+        (f, vals.get("badlar"), vals.get("tamar"), vals.get("com3500"))
+        for f, vals in sorted(variables.items())
+    ]
+
+    if not rows:
+        log("SQL variables: no hay filas válidas para upsert.")
+        return 0
+
+    sql = """
+        INSERT INTO on_primaria_variables_mercado (fecha, badlar, tamar, com3500)
+        VALUES %s
+        ON CONFLICT (fecha) DO UPDATE SET
+            badlar = COALESCE(EXCLUDED.badlar, on_primaria_variables_mercado.badlar),
+            tamar = COALESCE(EXCLUDED.tamar, on_primaria_variables_mercado.tamar),
+            com3500 = COALESCE(EXCLUDED.com3500, on_primaria_variables_mercado.com3500),
+            updated_at = NOW()
+    """
+
+    conn = connect_db_sql()
+    try:
+        ensure_variables_schema(conn)
+        from psycopg2.extras import execute_values
+        with conn:
+            with conn.cursor() as cur:
+                execute_values(cur, sql, rows, page_size=1000)
+        log(f"SQL variables: UPSERT ejecutado OK. Fechas: {len(rows):,}")
+        return len(rows)
+    finally:
+        conn.close()
 
 # ============================================================
 # HELPERS
@@ -463,12 +665,19 @@ def main() -> int:
             df_com=df_com,
         )
 
-        if total_insertados == 0:
-            log("Proceso finalizado OK. No había variables nuevas para cargar.")
+        if DRY_RUN:
+            log("DRY_RUN=True. No se subió nada a Drive ni se escribió en SQL.")
             return 0
 
-        if DRY_RUN:
-            log("DRY_RUN=True. No se subió nada a Drive.")
+        # SQL se actualiza siempre, aunque el Excel no tenga filas nuevas.
+        # Esto permite reparar/catchupear la DB sin depender de que haya datos nuevos en la hoja.
+        if SQL_UPDATE_ENABLED:
+            upsert_variables_sql(df_badlar, df_tamar, df_com)
+        else:
+            log("SQL_UPDATE_ENABLED=False. Se saltea upsert en on_primaria_variables_mercado.")
+
+        if total_insertados == 0:
+            log("Proceso finalizado OK. No había variables nuevas para cargar en Excel; SQL quedó actualizado.")
             return 0
 
         subir_xlsx_drive(service, DRIVE_FILE_ID, LOCAL_UPDATED_FILE)
