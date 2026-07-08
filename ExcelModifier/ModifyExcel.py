@@ -17,7 +17,7 @@ Flujo:
     6) Sube el .xlsx actualizado al mismo archivo de Drive.
 
 Requisitos:
-    pip install pandas openpyxl google-api-python-client google-auth
+    pip install pandas openpyxl google-api-python-client google-auth psycopg2-binary
 """
 
 from __future__ import annotations
@@ -29,10 +29,12 @@ import sys
 import json
 import base64
 import math
+import hashlib
 import shutil
 from copy import copy
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
+from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -62,7 +64,52 @@ LOCAL_BACKUP_FILE = PROJECT_ROOT / "DataStorage" / f"backup_Base_ONs_Nueva_{date
 LOCAL_UPDATED_FILE = PROJECT_ROOT / "DataStorage" / "Base ONs - Nueva_ACTUALIZADA.xlsx"
 PREVIEW_FILE = PROJECT_ROOT / "DataStorage" / "preview_base_ons_a_insertar.xlsx"
 
+
+def _manual_load_env_file(path: Path) -> None:
+    """Carga .env/.ENV local sin pisar variables ya existentes. Sirve para correr desde VS Code."""
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+
+        if not key:
+            continue
+
+        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+            value = value[1:-1]
+
+        os.environ.setdefault(key, value)
+
+
+def load_local_env_files() -> None:
+    seen = set()
+    for p in [PROJECT_ROOT / ".env", PROJECT_ROOT / ".ENV", Path.cwd() / ".env", Path.cwd() / ".ENV"]:
+        rp = str(p.resolve())
+        if rp in seen:
+            continue
+        seen.add(rp)
+        _manual_load_env_file(p)
+
+    try:
+        from dotenv import load_dotenv
+        for p in [PROJECT_ROOT / ".env", PROJECT_ROOT / ".ENV", Path.cwd() / ".env", Path.cwd() / ".ENV"]:
+            if p.exists():
+                load_dotenv(p, override=False)
+    except Exception:
+        pass
+
+
+load_local_env_files()
+
 DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() in {"1", "true", "yes", "y", "si", "sí"}
+SQL_UPDATE_ENABLED = os.getenv("SQL_UPDATE_ENABLED", "true").strip().lower() not in {"0", "false", "no", "n"}
 
 
 # ============================================================
@@ -187,6 +234,241 @@ def subir_xlsx_drive(service, file_id: str, archivo: Path) -> None:
 
     log(f"Archivo actualizado en Drive OK. ID: {updated.get('id')}")
 
+
+
+# ============================================================
+# POSTGRESQL - on_primaria
+# ============================================================
+
+def connect_db_sql():
+    try:
+        import psycopg2
+    except ImportError as e:
+        raise RuntimeError("Falta instalar psycopg2-binary. Ejecutá: pip install psycopg2-binary") from e
+
+    # Local: podés guardar el contenido de DATABASE_PUBLIC_URL como DATABASE_URL.
+    # También acepto DATABASE_PUBLIC_URL directo para evitar errores de nombre.
+    database_url = (os.getenv("DATABASE_URL", "").strip()
+                    or os.getenv("DATABASE_PUBLIC_URL", "").strip())
+    if database_url:
+        return psycopg2.connect(database_url)
+
+    required = ["PGHOST", "PGDATABASE", "PGUSER", "PGPASSWORD"]
+    missing = [k for k in required if not os.getenv(k)]
+    if missing:
+        raise RuntimeError(
+            "Faltan credenciales DB. Definí DATABASE_URL en .ENV o estas variables: " + ", ".join(missing)
+        )
+
+    return psycopg2.connect(
+        host=os.getenv("PGHOST"),
+        port=int(os.getenv("PGPORT", "5432")),
+        dbname=os.getenv("PGDATABASE"),
+        user=os.getenv("PGUSER"),
+        password=os.getenv("PGPASSWORD"),
+        sslmode=os.getenv("PGSSLMODE", "require"),
+    )
+
+
+def ensure_on_primaria_schema(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'on_primaria'
+        """)
+        cols = {r[0] for r in cur.fetchall()}
+
+    required = {
+        "fecha_colocacion", "fecha_emision_liquidacion", "sociedad", "serie_clase",
+        "moneda", "monto_nominal", "regimen_emision", "tasa", "tipo_tasa",
+        "tasa_base", "precio_corte", "tna_inicial", "plazo_meses", "margen",
+        "com3500", "mm_usd", "source_hash", "source_file", "source_row",
+    }
+    missing = required - cols
+    if missing:
+        raise RuntimeError(
+            "La tabla on_primaria no tiene el esquema esperado. Faltan columnas: " + ", ".join(sorted(missing))
+        )
+
+
+def _to_db_date(x):
+    if x is None:
+        return None
+    if isinstance(x, datetime):
+        return x.date()
+    if isinstance(x, date):
+        return x
+    try:
+        if pd.isna(x):
+            return None
+    except Exception:
+        pass
+    dt = pd.to_datetime(x, errors="coerce")
+    if pd.isna(dt):
+        return None
+    return dt.date()
+
+
+def _to_db_decimal(x):
+    if x is None:
+        return None
+    try:
+        if pd.isna(x):
+            return None
+    except Exception:
+        pass
+    if isinstance(x, Decimal):
+        return x
+    if isinstance(x, bool):
+        return None
+    if isinstance(x, (int, float)):
+        if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+            return None
+        return Decimal(str(x))
+    s = str(x).replace("\u00A0", " ").strip()
+    if not s or s.upper() in {"#N/A", "#VALUE!", "#REF!", "#DIV/0!", "N/A", "NA", "NULL", "NONE", "NAN"}:
+        return None
+    if s in {"-", "–", "—"}:
+        return None
+    had_percent = "%" in s
+    s = s.replace("%", "").replace("$", "").replace("USD", "").replace("US$", "").replace("U$S", "")
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s and "." not in s:
+        s = s.replace(",", ".")
+    s = "".join(ch for ch in s if ch in "0123456789.-+")
+    if not s or s in {".", "-", "+"}:
+        return None
+    try:
+        num = Decimal(s)
+    except InvalidOperation:
+        return None
+    if had_percent and abs(num) > 1:
+        num = num / Decimal("100")
+    return num
+
+
+def _db_text(x):
+    if x is None:
+        return None
+    try:
+        if pd.isna(x):
+            return None
+    except Exception:
+        pass
+    s = str(x).replace("\u00A0", " ").strip()
+    if not s or s.upper() in {"NAN", "NONE", "NULL", "#N/A", "#VALUE!"}:
+        return None
+    return " ".join(s.split())
+
+
+def _as_hash_value(x) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, (datetime, date)):
+        return x.isoformat()
+    if isinstance(x, Decimal):
+        return format(x.normalize(), "f")
+    return str(x).strip().upper()
+
+
+def _make_source_hash(values: dict) -> str:
+    # Misma lógica conceptual que el backfill: clave natural de la emisión.
+    parts = [
+        values.get("fecha_colocacion"),
+        values.get("fecha_emision_liquidacion"),
+        values.get("sociedad"),
+        values.get("serie_clase"),
+        values.get("moneda"),
+        values.get("monto_nominal"),
+        values.get("regimen_emision"),
+        values.get("tasa"),
+        values.get("tipo_tasa"),
+        values.get("precio_corte"),
+        values.get("tna_inicial"),
+        values.get("plazo_meses"),
+        values.get("margen"),
+    ]
+    raw = "|".join(_as_hash_value(x) for x in parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def upsert_on_primaria_sql(df_base: pd.DataFrame, source_file: str = "a3_on_corporativas.xlsx") -> int:
+    """
+    Inserta en SQL las mismas filas nuevas que se insertan en el Excel.
+
+    COM3500, tasa_base y MM USD pueden ir NULL: on_primaria_view los completa desde
+    on_primaria_variables_mercado, que actualiza el otro modifier.
+    """
+    if df_base is None or df_base.empty:
+        log("SQL on_primaria: df_base vacío. No hay nada para upsert.")
+        return 0
+
+    rows = []
+    for idx, r in df_base.reset_index(drop=True).iterrows():
+        values = {
+            "fecha_colocacion": _to_db_date(r.get("Fecha Colocación")),
+            "fecha_emision_liquidacion": _to_db_date(r.get("Fecha de Emisión y Liquidación")),
+            "sociedad": _db_text(r.get("Sociedad")),
+            "serie_clase": _db_text(r.get("Serie/Clase")),
+            "moneda": _db_text(r.get("Moneda")),
+            "monto_nominal": _to_db_decimal(r.get("Monto nominal (moneda emisión)")),
+            "regimen_emision": _db_text(r.get("Régimen de emisión")),
+            "tasa": _db_text(r.get("Tasa")),
+            "tipo_tasa": _db_text(r.get("Tipo de Tasa")),
+            "tasa_base": _to_db_decimal(r.get("Tasa Base")),
+            "precio_corte": _to_db_decimal(r.get("Precio de corte")),
+            "tna_inicial": _to_db_decimal(r.get("TNA inicial")),
+            "plazo_meses": _to_db_decimal(r.get("Plazo (meses)")),
+            "margen": _to_db_decimal(r.get("Margen")),
+            "com3500": None,
+            "mm_usd": None,
+            "source_file": source_file,
+            "source_row": None,
+        }
+
+        if values["fecha_colocacion"] is None or not values["sociedad"] or not values["moneda"]:
+            log(f"SQL on_primaria: omito fila transformada {idx + 1} por faltar fecha/sociedad/moneda.")
+            continue
+
+        values["source_hash"] = _make_source_hash(values)
+        rows.append(values)
+
+    if not rows:
+        log("SQL on_primaria: no quedaron filas válidas para upsert.")
+        return 0
+
+    cols = [
+        "fecha_colocacion", "fecha_emision_liquidacion", "sociedad", "serie_clase", "moneda",
+        "monto_nominal", "regimen_emision", "tasa", "tipo_tasa", "tasa_base", "precio_corte",
+        "tna_inicial", "plazo_meses", "margen", "com3500", "mm_usd", "source_hash",
+        "source_file", "source_row",
+    ]
+    data = [tuple(row.get(c) for c in cols) for row in rows]
+    update_cols = [c for c in cols if c != "source_hash"]
+    set_clause = ",\n            ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
+
+    sql = f"""
+        INSERT INTO on_primaria ({", ".join(cols)})
+        VALUES %s
+        ON CONFLICT (source_hash) DO UPDATE SET
+            {set_clause},
+            updated_at = NOW()
+    """
+
+    conn = connect_db_sql()
+    try:
+        ensure_on_primaria_schema(conn)
+        from psycopg2.extras import execute_values
+        with conn:
+            with conn.cursor() as cur:
+                execute_values(cur, sql, data, page_size=1000)
+        log(f"SQL on_primaria: UPSERT ejecutado OK. Filas: {len(rows):,}")
+        return len(rows)
+    finally:
+        conn.close()
 
 # ============================================================
 # HELPERS
@@ -1145,10 +1427,20 @@ def main() -> int:
         log(f"Preview generado: {PREVIEW_FILE}")
 
         if DRY_RUN:
-            log("DRY_RUN=True. No se escribió nada en Drive.")
+            log("DRY_RUN=True. No se escribió nada en Drive ni en SQL.")
             return 0
 
+        # 1) Primero genero el Excel actualizado localmente.
         insertar_en_workbook(LOCAL_DOWNLOAD_FILE, df_base)
+
+        # 2) Después actualizo SQL ANTES de subir a Drive.
+        #    Si SQL falla, no subimos el Excel: así el próximo run puede reintentar todo sin perder filas.
+        if SQL_UPDATE_ENABLED:
+            upsert_on_primaria_sql(df_base, source_file=A3_FILE.name)
+        else:
+            log("SQL_UPDATE_ENABLED=False. Se saltea upsert en on_primaria.")
+
+        # 3) Último paso: subir Excel a Drive.
         subir_xlsx_drive(service, DRIVE_FILE_ID, LOCAL_UPDATED_FILE)
 
         log("Proceso finalizado OK.")
