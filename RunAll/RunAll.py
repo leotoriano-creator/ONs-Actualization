@@ -12,8 +12,10 @@ Railway:
     Start Command:
         python RunAll/RunAll.py
 
-    Variable obligatoria:
-        GOOGLE_SERVICE_ACCOUNT_JSON
+    Variables:
+        DATABASE_URL (o PGHOST/PGDATABASE/PGUSER/PGPASSWORD)
+        EXCEL_UPDATE_ENABLED=true para volver a escribir el Excel de Drive
+            (requiere GOOGLE_SERVICE_ACCOUNT_JSON). Por defecto sólo SQL.
 """
 
 from __future__ import annotations
@@ -45,12 +47,12 @@ SCRIPTS = [
         "required_outputs": [DATA_STORAGE_DIR / "variables_mercado.xlsx"],
     },
     {
-        "name": "Actualizar solapa VARIABLES",
+        "name": "Actualizar VARIABLES (SQL)",
         "path": EXCEL_MODIFIER_DIR / "ModifyExcelUSD&TAMAR.py",
         "required_outputs": [],
     },
     {
-        "name": "Actualizar solapa BASE",
+        "name": "Actualizar BASE ONs (SQL)",
         "path": EXCEL_MODIFIER_DIR / "ModifyExcel.py",
         "required_outputs": [],
     },
@@ -92,14 +94,15 @@ def validar_estructura() -> None:
         if not item["path"].exists():
             errores.append(f"No existe script: {item['path']}")
 
+    excel_enabled = os.getenv("EXCEL_UPDATE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "y", "si", "sí"}
     google_credentials = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    if not google_credentials:
-        errores.append("No existe la variable de entorno GOOGLE_SERVICE_ACCOUNT_JSON.")
+    if excel_enabled and not google_credentials:
+        errores.append("EXCEL_UPDATE_ENABLED=true pero no existe la variable GOOGLE_SERVICE_ACCOUNT_JSON.")
 
     if errores:
         raise FileNotFoundError("\n".join(errores))
 
-    log("Variable GOOGLE_SERVICE_ACCOUNT_JSON detectada correctamente.")
+    log(f"Excel de Drive: {'ACTIVADO' if excel_enabled else 'DESACTIVADO (sólo SQL)'}")
 
 
 def validar_outputs(outputs: list[Path], etapa: str) -> None:

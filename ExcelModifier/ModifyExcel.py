@@ -110,6 +110,12 @@ load_local_env_files()
 
 DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() in {"1", "true", "yes", "y", "si", "sí"}
 SQL_UPDATE_ENABLED = os.getenv("SQL_UPDATE_ENABLED", "true").strip().lower() not in {"0", "false", "no", "n"}
+# El Excel de Drive dejó de abrir con openpyxl (Nested.from_tree). Por defecto sólo se actualiza SQL.
+EXCEL_UPDATE_ENABLED = os.getenv("EXCEL_UPDATE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "y", "si", "sí"}
+# Modo sólo-SQL: se reprocesan las liquidaciones desde (última fecha en SQL - días de margen),
+# salteando las emisiones que ya existen. ON_SQL_DESDE=YYYY-MM-DD fuerza la fecha de corte.
+ON_SQL_DESDE = os.getenv("ON_SQL_DESDE", "").strip()
+ON_SQL_DIAS_MARGEN = int(os.getenv("ON_SQL_DIAS_MARGEN", "15"))
 
 
 # ============================================================
@@ -393,6 +399,42 @@ def _make_source_hash(values: dict) -> str:
     ]
     raw = "|".join(_as_hash_value(x) for x in parts)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _clave_natural(fecha_liq, sociedad, serie_clase, moneda) -> tuple:
+    return (
+        _to_db_date(fecha_liq),
+        (_db_text(sociedad) or "").upper(),
+        (_db_text(serie_clase) or "").upper(),
+        (_db_text(moneda) or "").upper(),
+    )
+
+
+def ultima_liquidacion_sql():
+    conn = connect_db_sql()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT MAX(fecha_emision_liquidacion) FROM on_primaria")
+            return cur.fetchone()[0]
+    finally:
+        conn.close()
+
+
+def claves_existentes_sql(desde: date) -> set:
+    conn = connect_db_sql()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT fecha_emision_liquidacion, sociedad, serie_clase, moneda
+                FROM on_primaria
+                WHERE fecha_emision_liquidacion >= %s
+                """,
+                (desde,),
+            )
+            return {_clave_natural(*r) for r in cur.fetchall()}
+    finally:
+        conn.close()
 
 
 def upsert_on_primaria_sql(df_base: pd.DataFrame, source_file: str = "a3_on_corporativas.xlsx") -> int:
@@ -1353,6 +1395,73 @@ def insertar_en_workbook(xlsx_path: Path, df_base: pd.DataFrame) -> None:
 
 
 # ============================================================
+# MODO SÓLO SQL
+# ============================================================
+
+def actualizar_solo_sql(df_a3: pd.DataFrame) -> int:
+    if ON_SQL_DESDE:
+        desde = pd.Timestamp(ON_SQL_DESDE).normalize()
+        log(f"ON_SQL_DESDE forzado: {desde.strftime('%Y-%m-%d')}")
+    else:
+        ultima = ultima_liquidacion_sql()
+        if ultima is None:
+            raise RuntimeError("on_primaria está vacía. Definí ON_SQL_DESDE para la carga inicial.")
+        desde = pd.Timestamp(ultima).normalize() - pd.Timedelta(days=ON_SQL_DIAS_MARGEN)
+        log(f"Última Fecha de Emisión y Liquidación en SQL: {pd.Timestamp(ultima).strftime('%Y-%m-%d')}")
+        log(f"Reproceso desde: {desde.strftime('%Y-%m-%d')} ({ON_SQL_DIAS_MARGEN} días de margen)")
+
+    df_nuevo = df_a3[df_a3["fechaLiquidacion_dt"] >= desde].copy()
+    df_nuevo = df_nuevo.sort_values(
+        by=["fechaLiquidacion_dt", "fechaInicio_dt", "emisor", "titulo"],
+        ascending=[True, True, True, True],
+        na_position="last",
+    ).reset_index(drop=True)
+
+    if df_nuevo.empty:
+        log("No hay filas de A3 en la ventana. Proceso finalizado OK.")
+        return 0
+
+    df_base = transformar_a_base(df_nuevo)
+
+    existentes = claves_existentes_sql(desde.date())
+    claves = df_base.apply(
+        lambda r: _clave_natural(
+            r["Fecha de Emisión y Liquidación"], r["Sociedad"], r["Serie/Clase"], r["Moneda"]
+        ),
+        axis=1,
+    )
+    ya_cargadas = claves.isin(existentes)
+    log(f"Filas A3 en ventana: {len(df_base)} | ya en SQL: {int(ya_cargadas.sum())} | nuevas: {int((~ya_cargadas).sum())}")
+    df_base = df_base[~ya_cargadas].reset_index(drop=True)
+
+    for _, r in df_base.iterrows():
+        log(
+            f"  + {r['Fecha de Emisión y Liquidación']:%Y-%m-%d} | {r['Sociedad']} | {r['Serie/Clase']} | "
+            f"{r['Moneda']} | {r['Monto nominal (moneda emisión)']}"
+        )
+
+    if df_base.empty:
+        log("No hay emisiones nuevas para SQL. Proceso finalizado OK.")
+        return 0
+
+    PREVIEW_FILE.parent.mkdir(parents=True, exist_ok=True)
+    df_base.to_excel(PREVIEW_FILE, index=False)
+    log(f"Preview generado: {PREVIEW_FILE}")
+
+    if DRY_RUN:
+        log("DRY_RUN=True. No se escribió nada en SQL.")
+        return 0
+
+    if not SQL_UPDATE_ENABLED:
+        log("SQL_UPDATE_ENABLED=False. Se saltea upsert en on_primaria.")
+        return 0
+
+    upsert_on_primaria_sql(df_base, source_file=A3_FILE.name)
+    log("Proceso finalizado OK.")
+    return 0
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -1360,12 +1469,6 @@ def main() -> int:
     try:
         if not A3_FILE.exists():
             raise FileNotFoundError(f"No encontré el archivo scrapeado: {A3_FILE}")
-
-        service = conectar_drive()
-
-        descargar_xlsx_drive(service, DRIVE_FILE_ID, LOCAL_DOWNLOAD_FILE)
-        shutil.copy2(LOCAL_DOWNLOAD_FILE, LOCAL_BACKUP_FILE)
-        log(f"Backup local creado: {LOCAL_BACKUP_FILE}")
 
         log(f"Leyendo archivo A3: {A3_FILE}")
         df_a3 = pd.read_excel(A3_FILE)
@@ -1396,6 +1499,16 @@ def main() -> int:
             df_a3["fechaInicio_dt"] = df_a3["fechaInicio"].apply(parse_fecha_a3)
         else:
             df_a3["fechaInicio_dt"] = pd.NaT
+
+        if not EXCEL_UPDATE_ENABLED:
+            log("EXCEL_UPDATE_ENABLED=False. Sólo se actualiza SQL on_primaria (no se toca Drive).")
+            return actualizar_solo_sql(df_a3)
+
+        service = conectar_drive()
+
+        descargar_xlsx_drive(service, DRIVE_FILE_ID, LOCAL_DOWNLOAD_FILE)
+        shutil.copy2(LOCAL_DOWNLOAD_FILE, LOCAL_BACKUP_FILE)
+        log(f"Backup local creado: {LOCAL_BACKUP_FILE}")
 
         wb_check = load_workbook(LOCAL_DOWNLOAD_FILE, data_only=False)
         ws_check = wb_check[WORKSHEET_NAME]

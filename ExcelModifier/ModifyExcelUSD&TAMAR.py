@@ -109,6 +109,8 @@ load_local_env_files()
 
 DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() in {"1", "true", "yes", "y", "si", "sí"}
 SQL_UPDATE_ENABLED = os.getenv("SQL_UPDATE_ENABLED", "true").strip().lower() not in {"0", "false", "no", "n"}
+# El Excel de Drive dejó de abrir con openpyxl (Nested.from_tree). Por defecto sólo se actualiza SQL.
+EXCEL_UPDATE_ENABLED = os.getenv("EXCEL_UPDATE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "y", "si", "sí"}
 
 
 # ============================================================
@@ -651,6 +653,17 @@ def actualizar_workbook_variables(xlsx_path: Path, df_badlar: pd.DataFrame, df_t
 def main() -> int:
     try:
         df_badlar, df_tamar, df_com = cargar_variables_mercado()
+
+        if not EXCEL_UPDATE_ENABLED:
+            log("EXCEL_UPDATE_ENABLED=False. Sólo se actualiza SQL on_primaria_variables_mercado (no se toca Drive).")
+            if DRY_RUN:
+                log("DRY_RUN=True. No se escribió nada en SQL.")
+            elif SQL_UPDATE_ENABLED:
+                upsert_variables_sql(df_badlar, df_tamar, df_com)
+            else:
+                log("SQL_UPDATE_ENABLED=False. Se saltea upsert en on_primaria_variables_mercado.")
+            log("Proceso finalizado OK.")
+            return 0
 
         service = conectar_drive()
 
