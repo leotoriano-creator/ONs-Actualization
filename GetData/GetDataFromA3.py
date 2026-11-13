@@ -21,7 +21,7 @@ import re
 import sys
 import json
 from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from urllib.parse import quote
 
 import pandas as pd
@@ -35,6 +35,8 @@ import requests
 # Fecha inicial de descarga.
 # La fecha final se calcula automáticamente como hoy.
 FECHA_DESDE = "2026-05-12"
+# MAE rechaza (HTTP 400) rangos de más de 180 días: se pide por tramos.
+MAX_DIAS_POR_CONSULTA = 179
 
 BASE_URL = "https://api.marketdata.mae.com.ar/api/mercado/licitacionesporestado/Todos"
 
@@ -89,6 +91,34 @@ def construir_endpoint(fecha_desde: str = FECHA_DESDE, fecha_hasta: str | None =
     payload_encoded = quote(payload_json, safe="{}")
 
     return f"{BASE_URL}?oTitulo={payload_encoded}"
+
+
+def tramos_fechas(fecha_desde: str, fecha_hasta: str, max_dias: int = MAX_DIAS_POR_CONSULTA):
+    """Parte [desde, hasta] en ventanas contiguas de a lo sumo max_dias días."""
+    inicio = date.fromisoformat(fecha_desde)
+    fin = date.fromisoformat(fecha_hasta)
+    tramos = []
+    while inicio <= fin:
+        cierre = min(inicio + timedelta(days=max_dias), fin)
+        tramos.append((inicio.isoformat(), cierre.isoformat()))
+        inicio = cierre + timedelta(days=1)
+    return tramos
+
+
+def descargar_periodo(fecha_desde: str = FECHA_DESDE, fecha_hasta: str | None = None) -> list[dict]:
+    """Baja todo el período por tramos y elimina repetidos (por id)."""
+    if fecha_hasta is None:
+        fecha_hasta = date.today().strftime("%Y-%m-%d")
+    vistos = set()
+    data = []
+    for desde, hasta in tramos_fechas(fecha_desde, fecha_hasta):
+        for item in descargar_json(construir_endpoint(desde, hasta)):
+            clave = item.get("id") if isinstance(item, dict) and item.get("id") is not None                 else json.dumps(item, sort_keys=True, ensure_ascii=False)
+            if clave in vistos:
+                continue
+            vistos.add(clave)
+            data.append(item)
+    return data
 
 
 def descargar_json(endpoint_url: str) -> list[dict]:
@@ -404,11 +434,10 @@ def main() -> int:
     try:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-        endpoint_url = construir_endpoint()
         log(f"Fecha desde: {FECHA_DESDE}")
         log(f"Fecha hasta: {date.today().strftime('%Y-%m-%d')}")
 
-        data = descargar_json(endpoint_url)
+        data = descargar_periodo()
 
         log(f"Registros totales descargados: {len(data):,}")
 
